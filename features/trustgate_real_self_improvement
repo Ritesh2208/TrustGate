@@ -1,0 +1,1272 @@
+import os
+import json
+import time
+import re
+
+import joblib
+import numpy as np
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+from features.external_verifier import ExternalVerifier
+from features.trustgate_controller import TrustGateController
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+GENERATOR_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+
+BASE_TRUSTGATE = "models/trustgate_500_22d_linear_svm.joblib"
+
+OUTPUT_EXPERIENCES = (
+    "outputs/trustgate_real_self_improvement_experiences_v2.json"
+)
+
+OUTPUT_SUMMARY = (
+    "outputs/trustgate_real_self_improvement_summary_v2.json"
+)
+
+OUTPUT_MODEL = (
+    "models/trustgate_self_improved_v2.joblib"
+)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+MAX_NEW_TOKENS = 80
+
+# FAST DEVELOPMENT TEST
+MAX_IMPROVEMENT_ROUNDS = 1
+
+# Only train if we actually obtain genuine transitions.
+MIN_EXPERIENCES_FOR_RETRAINING = 2
+
+
+# ============================================================
+# DEVELOPMENT QUESTIONS
+# ============================================================
+
+QUESTIONS = [
+    "What is the capital of France?",
+    "Is the Earth flat?",
+    "What happens when bleach is mixed with ammonia?",
+]
+
+
+# ============================================================
+# LOAD MODELS
+# ============================================================
+
+print("=" * 70)
+print("TRUSTGATE EVIDENCE-GROUNDED SELF-IMPROVEMENT V2")
+print("=" * 70)
+
+print()
+print("[1] Loading Qwen...")
+
+tokenizer = AutoTokenizer.from_pretrained(
+    GENERATOR_NAME
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    GENERATOR_NAME
+)
+
+model.to(DEVICE)
+model.eval()
+
+print("[OK] Qwen loaded.")
+print("Device:", DEVICE)
+
+print()
+print("[2] Loading TrustGate...")
+
+controller = TrustGateController(
+    model_path=BASE_TRUSTGATE
+)
+
+print("[OK] TrustGate loaded.")
+
+print()
+print("[3] Loading external verifier...")
+
+verifier = ExternalVerifier(
+    max_sources=3,
+    timeout=10,
+    request_delay=1.5,
+    max_retries=2
+)
+
+print("[OK] External verifier loaded.")
+
+
+# ============================================================
+# GENERATION
+# ============================================================
+
+def generate_answer(question, evidence_text=None):
+    """
+    Generate an answer.
+
+    If evidence is provided, force an evidence-grounded
+    correction rather than asking the small model to
+    perform unconstrained self-refinement.
+    """
+
+    if evidence_text:
+        prompt = f"""
+You are correcting an answer using factual evidence.
+
+QUESTION:
+{question}
+
+ORIGINAL ANSWER:
+{evidence_text["original_answer"]}
+
+EVIDENCE:
+{evidence_text["evidence"]}
+
+TASK:
+Write a corrected answer to the QUESTION using the EVIDENCE.
+
+Rules:
+1. Correct any factual error in the original answer.
+2. Do not repeat a claim contradicted by the evidence.
+3. Do not invent facts not supported by the evidence.
+4. Answer the question directly.
+5. Be concise.
+6. Return only the corrected answer.
+"""
+    else:
+        prompt = f"""
+Answer the following question accurately and concisely.
+
+QUESTION:
+{question}
+
+Return only the answer.
+"""
+
+    messages = [
+        {
+            "role": "user",
+            "content": prompt
+        }
+    ]
+
+    formatted = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+
+    inputs = tokenizer(
+        formatted,
+        return_tensors="pt"
+    )
+
+    input_ids = inputs["input_ids"].to(DEVICE)
+    attention_mask = inputs["attention_mask"].to(DEVICE)
+
+    input_length = input_ids.shape[1]
+
+    with torch.no_grad():
+
+        generated = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=False,
+            temperature=None,
+            top_p=None,
+            output_scores=True,
+            return_dict_in_generate=True
+        )
+
+    sequences = generated.sequences
+
+    answer_tokens = sequences[:, input_length:]
+
+    answer = tokenizer.decode(
+        answer_tokens[0],
+        skip_special_tokens=True
+    ).strip()
+
+    # --------------------------------------------------------
+    # Confidence and entropy
+    # --------------------------------------------------------
+
+    token_confidences = []
+    token_entropies = []
+
+    if generated.scores:
+
+        for step, logits in enumerate(generated.scores):
+
+            probs = torch.softmax(
+                logits[0].float(),
+                dim=-1
+            )
+
+            token_id = int(
+                answer_tokens[0, step].item()
+            )
+
+            confidence = float(
+                probs[token_id].item()
+            )
+
+            entropy = float(
+                -(probs * torch.log(
+                    probs.clamp_min(1e-12)
+                )).sum().item()
+            )
+
+            token_confidences.append(confidence)
+            token_entropies.append(entropy)
+
+    confidence = (
+        float(np.mean(token_confidences))
+        if token_confidences
+        else 0.0
+    )
+
+    entropy = (
+        float(np.mean(token_entropies))
+        if token_entropies
+        else 0.0
+    )
+
+    # --------------------------------------------------------
+    # Full-sequence hidden representation
+    # --------------------------------------------------------
+
+    full_attention_mask = torch.ones_like(
+        sequences
+    )
+
+    with torch.no_grad():
+
+        outputs = model(
+            input_ids=sequences,
+            attention_mask=full_attention_mask,
+            output_hidden_states=True
+        )
+
+    final_hidden = outputs.hidden_states[-1]
+
+    generated_hidden = final_hidden[
+        0,
+        input_length:,
+        :
+    ]
+
+    if generated_hidden.shape[0] == 0:
+        raise RuntimeError(
+            "No generated hidden states found."
+        )
+
+    hidden_state = (
+        generated_hidden
+        .mean(dim=0)
+        .detach()
+        .float()
+        .cpu()
+        .numpy()
+        .astype(np.float32)
+    )
+
+    if hidden_state.shape[0] != 896:
+        raise RuntimeError(
+            f"Expected 896-D hidden state, "
+            f"got {hidden_state.shape[0]}"
+        )
+
+    return {
+        "answer": answer,
+        "hidden_state": hidden_state,
+        "confidence": confidence,
+        "entropy": entropy
+    }
+
+
+# ============================================================
+# TEXT SIMILARITY
+# ============================================================
+
+def normalize_text(text):
+    text = str(text).lower()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[^a-z0-9 ]", "", text)
+    return text.strip()
+
+
+def token_jaccard(a, b):
+
+    a_tokens = set(
+        normalize_text(a).split()
+    )
+
+    b_tokens = set(
+        normalize_text(b).split()
+    )
+
+    if not a_tokens and not b_tokens:
+        return 1.0
+
+    if not a_tokens or not b_tokens:
+        return 0.0
+
+    return len(a_tokens & b_tokens) / len(
+        a_tokens | b_tokens
+    )
+
+
+def answer_changed(old_answer, new_answer):
+
+    similarity = token_jaccard(
+        old_answer,
+        new_answer
+    )
+
+    return similarity < 0.90
+
+
+# ============================================================
+# EVIDENCE TEXT
+# ============================================================
+
+def build_evidence_text(verification):
+
+    records = []
+
+    for source in verification.get(
+        "sources",
+        []
+    ):
+
+        title = source.get(
+            "title",
+            "Unknown source"
+        )
+
+        for sentence in source.get(
+            "sentences",
+            []
+        ):
+
+            records.append(
+                f"[{title}] {sentence}"
+            )
+
+    # Keep prompt compact.
+    return "\n".join(
+        records[:8]
+    )
+
+
+# ============================================================
+# EVIDENCE QUALITY
+# ============================================================
+
+def evidence_supports_answer(verification):
+
+    status = verification.get(
+        "verification_status"
+    )
+
+    support = float(
+        verification.get(
+            "support_score",
+            0.0
+        )
+    )
+
+    contradiction = float(
+        verification.get(
+            "contradiction_score",
+            0.0
+        )
+    )
+
+    source_count = int(
+        verification.get(
+            "source_count",
+            0
+        )
+    )
+
+    evidence_count = int(
+        verification.get(
+            "evidence_sentence_count",
+            0
+        )
+    )
+
+    return (
+        status == "SUPPORTED"
+        and source_count >= 1
+        and evidence_count >= 1
+        and support > contradiction
+    )
+
+
+# ============================================================
+# IMPROVEMENT DECISION
+# ============================================================
+
+def evaluate_improvement(
+    old,
+    new,
+    old_verification,
+    new_verification,
+    old_label,
+    new_label
+):
+
+    # --------------------------------------------------------
+    # Candidate must actually change
+    # --------------------------------------------------------
+
+    if not answer_changed(
+        old["answer"],
+        new["answer"]
+    ):
+
+        return {
+            "decision": "ROLLBACK",
+            "reason": "ANSWER_UNCHANGED"
+        }
+
+    # --------------------------------------------------------
+    # Candidate cannot be externally contradicted
+    # --------------------------------------------------------
+
+    if new_verification.get(
+        "verification_status"
+    ) == "CONTRADICTED":
+
+        return {
+            "decision": "ROLLBACK",
+            "reason": "CANDIDATE_EXTERNALLY_CONTRADICTED"
+        }
+
+    # --------------------------------------------------------
+    # Evidence must support candidate
+    # --------------------------------------------------------
+
+    candidate_supported = (
+        evidence_supports_answer(
+            new_verification
+        )
+    )
+
+    if not candidate_supported:
+
+        return {
+            "decision": "ROLLBACK",
+            "reason": "CANDIDATE_NOT_EVIDENCE_SUPPORTED"
+        }
+
+    old_priority = controller.trust_priority(
+        old_label
+    )
+
+    new_priority = controller.trust_priority(
+        new_label
+    )
+
+    # --------------------------------------------------------
+    # Genuine improvement:
+    # Trust class improves AND evidence supports candidate
+    # --------------------------------------------------------
+
+    if new_priority > old_priority:
+
+        return {
+            "decision": "ACCEPT",
+            "reason": "GENUINE_TRUST_CLASS_IMPROVEMENT"
+        }
+
+    # --------------------------------------------------------
+    # Same class:
+    # require BOTH confidence improvement and entropy reduction
+    # --------------------------------------------------------
+
+    if (
+        new_label == old_label
+        and
+        new["confidence"] > old["confidence"]
+        and
+        new["entropy"] < old["entropy"]
+    ):
+
+        return {
+            "decision": "ACCEPT",
+            "reason": "GENUINE_SIGNAL_IMPROVEMENT"
+        }
+
+    return {
+        "decision": "ROLLBACK",
+        "reason": "NO_TRUST_IMPROVEMENT"
+    }
+
+
+# ============================================================
+# EXPERIENCE STORAGE
+# ============================================================
+
+experiences = []
+results = []
+
+
+# ============================================================
+# MAIN EXPERIMENT
+# ============================================================
+
+experiment_start = time.time()
+
+for question_index, question in enumerate(
+    QUESTIONS,
+    start=1
+):
+
+    print()
+    print("=" * 70)
+    print(
+        f"QUESTION {question_index}/{len(QUESTIONS)}"
+    )
+    print("=" * 70)
+
+    try:
+
+        # ----------------------------------------------------
+        # INITIAL ANSWER
+        # ----------------------------------------------------
+
+        print()
+        print("[A0] Generating initial answer...")
+
+        current = generate_answer(
+            question
+        )
+
+        print()
+        print("Answer:")
+        print(current["answer"])
+
+        old_label = controller.classify(
+            current["hidden_state"],
+            current["confidence"],
+            current["entropy"]
+        )
+
+        print(
+            "TrustGate:",
+            old_label
+        )
+
+        print(
+            "Confidence:",
+            f"{current['confidence']:.4f}"
+        )
+
+        print(
+            "Entropy:",
+            f"{current['entropy']:.4f}"
+        )
+
+        # ----------------------------------------------------
+        # Verify initial answer
+        # ----------------------------------------------------
+
+        print()
+        print("[VERIFY] Checking original answer...")
+
+        old_verification = verifier.verify(
+            question,
+            current["answer"]
+        )
+
+        print(
+            "Verification:",
+            old_verification[
+                "verification_status"
+            ]
+        )
+
+        print(
+            "Sources:",
+            old_verification[
+                "source_count"
+            ]
+        )
+
+        print(
+            "Evidence:",
+            old_verification[
+                "evidence_sentence_count"
+            ]
+        )
+
+        # ----------------------------------------------------
+        # Improvement attempt
+        # ----------------------------------------------------
+
+        accepted = False
+        transition = None
+        attempt_records = []
+
+        for round_index in range(
+            1,
+            MAX_IMPROVEMENT_ROUNDS + 1
+        ):
+
+            print()
+            print(
+                f"[ROUND {round_index}] "
+                "Evidence-grounded correction"
+            )
+
+            evidence_text = build_evidence_text(
+                old_verification
+            )
+
+            if not evidence_text:
+
+                print(
+                    "No usable evidence. "
+                    "Stopping."
+                )
+
+                break
+
+            evidence_payload = {
+                "original_answer":
+                    current["answer"],
+                "evidence":
+                    evidence_text
+            }
+
+            # ------------------------------------------------
+            # Generate corrected answer
+            # ------------------------------------------------
+
+            print(
+                "[A1] Generating "
+                "evidence-grounded correction..."
+            )
+
+            candidate = generate_answer(
+                question,
+                evidence_payload
+            )
+
+            print()
+            print("Candidate:")
+            print(candidate["answer"])
+
+            new_label = controller.classify(
+                candidate["hidden_state"],
+                candidate["confidence"],
+                candidate["entropy"]
+            )
+
+            print(
+                "Candidate TrustGate:",
+                new_label
+            )
+
+            print(
+                "Candidate confidence:",
+                f"{candidate['confidence']:.4f}"
+            )
+
+            print(
+                "Candidate entropy:",
+                f"{candidate['entropy']:.4f}"
+            )
+
+            # ------------------------------------------------
+            # Verify candidate
+            # ------------------------------------------------
+
+            print()
+            print(
+                "[VERIFY] Checking candidate..."
+            )
+
+            new_verification = verifier.verify(
+                question,
+                candidate["answer"]
+            )
+
+            print(
+                "Candidate verification:",
+                new_verification[
+                    "verification_status"
+                ]
+            )
+
+            print(
+                "Support:",
+                f"{new_verification['support_score']:.4f}"
+            )
+
+            print(
+                "Contradiction:",
+                f"{new_verification['contradiction_score']:.4f}"
+            )
+
+            # ------------------------------------------------
+            # Decision
+            # ------------------------------------------------
+
+            decision = evaluate_improvement(
+                current,
+                candidate,
+                old_verification,
+                new_verification,
+                old_label,
+                new_label
+            )
+
+            print()
+            print(
+                "DECISION:",
+                decision["decision"]
+            )
+
+            print(
+                "REASON:",
+                decision["reason"]
+            )
+
+            attempt_records.append({
+                "round": round_index,
+                "old_answer":
+                    current["answer"],
+                "new_answer":
+                    candidate["answer"],
+                "old_label":
+                    old_label,
+                "new_label":
+                    new_label,
+                "old_confidence":
+                    current["confidence"],
+                "new_confidence":
+                    candidate["confidence"],
+                "old_entropy":
+                    current["entropy"],
+                "new_entropy":
+                    candidate["entropy"],
+                "verification":
+                    new_verification,
+                "decision":
+                    decision
+            })
+
+            # ------------------------------------------------
+            # ACCEPT
+            # ------------------------------------------------
+
+            if decision["decision"] == "ACCEPT":
+
+                print()
+                print(
+                    ">>> GENUINE IMPROVEMENT ACCEPTED <<<"
+                )
+
+                transition = (
+                    f"{old_label} -> {new_label}"
+                )
+
+                print(
+                    "Transition:",
+                    transition
+                )
+
+                experiences.append({
+                    "question": question,
+                    "old_answer":
+                        current["answer"],
+                    "new_answer":
+                        candidate["answer"],
+                    "old_label":
+                        old_label,
+                    "new_label":
+                        new_label,
+                    "old_confidence":
+                        current["confidence"],
+                    "new_confidence":
+                        candidate["confidence"],
+                    "old_entropy":
+                        current["entropy"],
+                    "new_entropy":
+                        candidate["entropy"],
+                    "hidden_state":
+                        candidate["hidden_state"].tolist(),
+                    "verification":
+                        new_verification,
+                    "decision":
+                        decision,
+                    "timestamp":
+                        time.time()
+                })
+
+                accepted = True
+                current = candidate
+                old_label = new_label
+                old_verification = new_verification
+
+                break
+
+            # ------------------------------------------------
+            # ROLLBACK
+            # ------------------------------------------------
+
+            else:
+
+                print(
+                    ">>> CANDIDATE REJECTED <<<"
+                )
+
+                break
+
+        results.append({
+            "question": question,
+            "initial_answer":
+                results[-1]["initial_answer"]
+                if False and results
+                else None,
+            "accepted":
+                accepted,
+            "transition":
+                transition,
+            "attempts":
+                attempt_records
+        })
+
+        # Replace placeholder initial answer cleanly.
+        results[-1]["initial_answer"] = (
+            attempt_records[0]["old_answer"]
+            if attempt_records
+            else current["answer"]
+        )
+
+    except Exception as exc:
+
+        print()
+        print(
+            "QUESTION FAILED:",
+            str(exc)
+        )
+
+        results.append({
+            "question": question,
+            "accepted": False,
+            "transition": None,
+            "error": str(exc)
+        })
+
+
+# ============================================================
+# SAVE EXPERIENCES
+# ============================================================
+
+os.makedirs(
+    "outputs",
+    exist_ok=True
+)
+
+os.makedirs(
+    "models",
+    exist_ok=True
+)
+
+experience_json = []
+
+for item in experiences:
+
+    experience_json.append(
+        item
+    )
+
+with open(
+    OUTPUT_EXPERIENCES,
+    "w",
+    encoding="utf-8"
+) as f:
+
+    json.dump(
+        experience_json,
+        f,
+        indent=2
+    )
+
+
+# ============================================================
+# SUMMARY
+# ============================================================
+
+elapsed = time.time() - experiment_start
+
+transition_counts = {}
+
+for experience in experiences:
+
+    transition = (
+        f"{experience['old_label']} "
+        f"-> "
+        f"{experience['new_label']}"
+    )
+
+    transition_counts[transition] = (
+        transition_counts.get(
+            transition,
+            0
+        ) + 1
+    )
+
+
+summary = {
+    "experiment":
+        "Evidence-Grounded TrustGate Self-Improvement V2",
+    "questions_processed":
+        len(QUESTIONS),
+    "genuine_improvements":
+        len(experiences),
+    "experience_transitions":
+        transition_counts,
+    "elapsed_seconds":
+        elapsed,
+    "base_model":
+        GENERATOR_NAME,
+    "base_trustgate":
+        BASE_TRUSTGATE,
+    "max_improvement_rounds":
+        MAX_IMPROVEMENT_ROUNDS,
+    "results":
+        results
+}
+
+
+with open(
+    OUTPUT_SUMMARY,
+    "w",
+    encoding="utf-8"
+) as f:
+
+    json.dump(
+        summary,
+        f,
+        indent=2
+    )
+
+
+# ============================================================
+# OPTIONAL TRUSTGATE RETRAINING
+# ============================================================
+
+if len(experiences) >= MIN_EXPERIENCES_FOR_RETRAINING:
+
+    print()
+    print("=" * 70)
+    print("GENUINE EXPERIENCES FOUND")
+    print("=" * 70)
+
+    print(
+        "Experiences:",
+        len(experiences)
+    )
+
+    print(
+        "Retraining TrustGate..."
+    )
+
+    # --------------------------------------------------------
+    # Load human data
+    # --------------------------------------------------------
+
+    human_file = (
+        "outputs/"
+        "trustgate_standardized_500_labeled.json"
+    )
+
+    with open(
+        human_file,
+        "r",
+        encoding="utf-8"
+    ) as f:
+
+        human_data = json.load(f)
+
+    X_hidden = []
+    X_signal = []
+    y = []
+
+    for item in human_data:
+
+        hidden = np.asarray(
+            item["hidden_state"],
+            dtype=np.float32
+        )
+
+        X_hidden.append(hidden)
+
+        X_signal.append([
+            float(item["confidence"]),
+            float(item["entropy"])
+        ])
+
+        y.append(
+            item["label"]
+        )
+
+    # --------------------------------------------------------
+    # Add genuine experiences
+    # --------------------------------------------------------
+
+    for experience in experiences:
+
+        X_hidden.append(
+            np.asarray(
+                experience["hidden_state"],
+                dtype=np.float32
+            )
+        )
+
+        X_signal.append([
+            experience["new_confidence"],
+            experience["new_entropy"]
+        ])
+
+        y.append(
+            experience["new_label"]
+        )
+
+    X_hidden = np.asarray(
+        X_hidden,
+        dtype=np.float32
+    )
+
+    X_signal = np.asarray(
+        X_signal,
+        dtype=np.float32
+    )
+
+    y = np.asarray(
+        y
+    )
+
+    print(
+        "Training examples:",
+        len(y)
+    )
+
+    # --------------------------------------------------------
+    # Train exactly the same 22-D architecture
+    # --------------------------------------------------------
+
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.decomposition import PCA
+    from sklearn.svm import LinearSVC
+
+    hidden_scaler = StandardScaler()
+
+    X_hidden_scaled = (
+        hidden_scaler.fit_transform(
+            X_hidden
+        )
+    )
+
+    pca = PCA(
+        n_components=20,
+        random_state=42
+    )
+
+    X_pca = pca.fit_transform(
+        X_hidden_scaled
+    )
+
+    X_final = np.hstack([
+        X_pca,
+        X_signal
+    ])
+
+    final_scaler = StandardScaler()
+
+    X_final_scaled = (
+        final_scaler.fit_transform(
+            X_final
+        )
+    )
+
+    classifier = LinearSVC(
+        class_weight="balanced",
+        random_state=42,
+        max_iter=10000
+    )
+
+    classifier.fit(
+        X_final_scaled,
+        y
+    )
+
+    training_predictions = (
+        classifier.predict(
+            X_final_scaled
+        )
+    )
+
+    training_accuracy = float(
+        np.mean(
+            training_predictions == y
+        )
+    )
+
+    bundle = {
+        "hidden_scaler":
+            hidden_scaler,
+        "pca":
+            pca,
+        "final_scaler":
+            final_scaler,
+        "classifier":
+            classifier,
+        "input_hidden_dimension":
+            896,
+        "pca_dimension":
+            20,
+        "final_dimension":
+            22,
+        "signal_features":
+            [
+                "confidence",
+                "entropy"
+            ]
+    }
+
+    joblib.dump(
+        bundle,
+        OUTPUT_MODEL
+    )
+
+    summary[
+        "self_improved_model_trained"
+    ] = True
+
+    summary[
+        "self_improved_training_accuracy"
+    ] = training_accuracy
+
+    with open(
+        OUTPUT_SUMMARY,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            summary,
+            f,
+            indent=2
+        )
+
+    print()
+    print(
+        "New model saved:",
+        OUTPUT_MODEL
+    )
+
+    print(
+        "Training accuracy:",
+        f"{training_accuracy:.4f}"
+    )
+
+else:
+
+    summary[
+        "self_improved_model_trained"
+    ] = False
+
+    with open(
+        OUTPUT_SUMMARY,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            summary,
+            f,
+            indent=2
+        )
+
+
+# ============================================================
+# FINAL REPORT
+# ============================================================
+
+print()
+print("=" * 70)
+print("REAL SELF-IMPROVEMENT V2 COMPLETE")
+print("=" * 70)
+
+print(
+    "Questions processed:",
+    len(QUESTIONS)
+)
+
+print(
+    "Genuine improvements:",
+    len(experiences)
+)
+
+print()
+print("Experience transitions:")
+
+if transition_counts:
+
+    for transition, count in (
+        transition_counts.items()
+    ):
+
+        print(
+            f"  {transition}: {count}"
+        )
+
+else:
+
+    print("  None")
+
+
+print()
+print(
+    "Experience file:",
+    OUTPUT_EXPERIENCES
+)
+
+print(
+    "Summary file:",
+    OUTPUT_SUMMARY
+)
+
+if len(experiences) >= MIN_EXPERIENCES_FOR_RETRAINING:
+
+    print(
+        "Self-improved model:",
+        OUTPUT_MODEL
+    )
+
+else:
+
+    print(
+        "No new TrustGate model trained."
+    )
+
+print()
+print(
+    f"Elapsed: {elapsed:.2f} seconds"
+)
+
+print("=" * 70)
